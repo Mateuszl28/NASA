@@ -1,0 +1,12 @@
+# environment
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.DS_Store
+
+# Calibration caches are keyed by a hash of the window they were fitted on, so
+# a stale one is ignored rather than wrong. The ones under data/twins/ for the
+# bundled scenarios are committed on purpose: they make a cold demo start in
+# seconds instead of minutes. Anything fitted to other data is local.
+data/twins/local-*
