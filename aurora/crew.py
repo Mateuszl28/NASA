@@ -29,6 +29,7 @@ from dataclasses import dataclass, field, replace
 import numpy as np
 
 from .model import NOMINAL_INPUT, UIDX, Params, achieved_activity, settle
+from .observe import vol_effect
 
 
 @dataclass(frozen=True)
@@ -90,7 +91,12 @@ def build_params(prof: Profile) -> Params:
     for _ in range(200):
         x = settle(p, NOMINAL_INPUT, x0=x, days=4000)
         A, S, V, F, I, C, M = (float(v) for v in x)
-        dep = max(0.0, -V)
+        # The same function the observation model uses, not a second copy of
+        # it. Two copies drifted apart the moment the surplus side gained a
+        # gain, and the declared quiet-day readings stopped being a fixed
+        # point by a few thousandths -- small, silent, and in exactly the three
+        # channels that respond to volume.
+        dep = vol_effect(V)
 
         # Hold unit fitness as the fixed point: pick the maintenance load that
         # exactly offsets microgravity decay at the completed training this

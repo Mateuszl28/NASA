@@ -70,19 +70,28 @@ from .observe import obs_sd
 from .signals import ABSOLUTE_LIMITS, MONITORED, SIGNALS, signals_of
 from .twin import FilterOut, OpenLoop, Window, open_loop, run_filter
 
-#: Scale of a "unit" change in each latent variable, used to standardise the
-#: fitted latent shift so that 1.0 means roughly "a change worth a sentence".
-#: Without this, a shift is reported in whatever unit the axis happens to use
-#: and plasma volume (a few hundredths) always looks negligible next to sleep
-#: debt (hours).
+#: Scale of a "unit" change in each latent variable, so that a shift of 1.0
+#: means the same thing on every axis. Without it a shift is reported in
+#: whatever unit the axis happens to use, and plasma volume (a few hundredths)
+#: always looks negligible beside sleep debt (hours).
+#:
+#: Set to the size of a change a flight surgeon would want a sentence about --
+#: a 5 % plasma-volume deficit, three hours of sleep debt -- rather than to
+#: something merely measurable. The distinction matters because the prior in
+#: `_project` is expressed in these units, so a scale set too small makes a
+#: real event look like a many-sigma excursion and shrinks it hard. Plasma
+#: volume was at 0.022, which put a genuine 14 % deficit five units out; the
+#: projection shrank it below the autonomic response it had itself caused, and
+#: the finding came back named after the symptom instead of the cause.
 LATENT_SCALE: dict[str, float] = {
-    "A": 0.18, "S": 1.8, "V": 0.022, "F": 0.030,
-    "I": 0.10, "C": 0.55, "M": 0.075,
+    "A": 0.25, "S": 3.0, "V": 0.055, "F": 0.045,
+    "I": 0.18, "C": 1.1, "M": 0.12,
 }
 
-#: Prior precision on the latent shift, in units of LATENT_SCALE. One means
-#: "a change of one scale unit is a priori as likely as not". See `_project`.
-RIDGE = 1.0
+#: Prior precision on the latent shift, in units of LATENT_SCALE. See
+#: `_project` -- it is what stops the fit explaining one channel's noise by
+#: moving whichever latent axis that channel happens to observe.
+RIDGE = 0.4
 
 #: Forecast lengths scanned every day. Short catches a step, long catches a
 #: drift; see the comment in `scan` for why one length is not enough.
@@ -141,6 +150,7 @@ class DayScore:
     latent_z: dict[str, float]         # the same, standardised
     channel_z: dict[str, float]        # per-channel residual z, latest day
     device_share: dict[str, float]     # share of residual SS per device
+    device_base: dict[str, float]      # the same shares when nothing is wrong
     pattern: str
     pattern_note: str
     pattern_fit: float
@@ -224,6 +234,14 @@ class ResidCal:
     #: it is measured rather than derived -- see `scan`.
     null_mean: dict[int, float] = field(default_factory=dict)
     null_sd: dict[int, float] = field(default_factory=dict)
+    #: Each device's share of the residual sum of squares when nothing is
+    #: wrong. Needed because the shares are wildly uneven by construction:
+    #: Bio-Monitor carries nine of the twelve monitored channels, so its share
+    #: sits near 0.8 on a perfectly healthy day. Testing against an absolute
+    #: 0.8 therefore called almost every finding an instrument fault --
+    #: including the schedule-driven one. Concentration only means something
+    #: measured against what that device normally contributes.
+    device_base: dict[str, float] = field(default_factory=dict)
 
     def studentise(self, raw: float, h: int) -> float:
         """Nominal standard deviations above this person's own quiet-window
@@ -350,6 +368,20 @@ def fit_resid_cal(w: Window, p: Params, *, sd_scale: dict[str, float] | None,
         if len(vals) >= 6:
             rc.null_mean[h] = float(np.mean(vals))
             rc.null_sd[h] = float(max(np.std(vals, ddof=1), 1e-3))
+
+    # Baseline device shares, from the same quiet forecasts.
+    acc: dict[str, float] = {}
+    for day in range(horizon + 1, min(calib_days, w.days)):
+        anchor = day - horizon
+        ol = open_loop(w, p, fo.x[anchor], fo.P[anchor], anchor, horizon,
+                       sd_scale=sd_scale)
+        if ol.reached == 0:
+            continue
+        for k, v in _device_share(ol, rc).items():
+            acc[k] = acc.get(k, 0.0) + v
+    tot = sum(acc.values())
+    if tot > 0:
+        rc.device_base = {k: v / tot for k, v in acc.items()}
 
     return rc
 
@@ -664,6 +696,7 @@ def scan(w: Window, p: Params, *, crew: str = "?",
             dof_used=int(round(k_dirs)),
             score=float(score), latent_push=latent_push, latent_z=latent_z,
             channel_z=ch_z, device_share=_device_share(ol, rcal),
+            device_base=dict(rcal.device_base),
             pattern=pattern, pattern_note=note, pattern_fit=float(fit),
             limit_breach=_limit_breach(w, day), in_band=band_ok,
             plan_share=share,
@@ -678,6 +711,10 @@ def scan(w: Window, p: Params, *, crew: str = "?",
 #: Share of the deviation the logged plan must account for before the finding
 #: is called the schedule's rather than the body's.
 _SCHEDULE_SHARE = 0.45
+
+#: How far a device's share of the residual must exceed its own quiet-window
+#: share before concentration counts as evidence of a fault.
+_DEVICE_EXCESS = 0.12
 
 
 def _attribute(ds: DayScore, concurrent: int, env_limit: bool,
@@ -694,19 +731,27 @@ def _attribute(ds: DayScore, concurrent: int, env_limit: bool,
     if concurrent >= 3 and coherent:
         return "environment"
 
-    # Instrument: the residual lives on one device and no coherent latent state
-    # accounts for it. Both halves are required. A real inflammatory response
-    # also concentrates in Bio-Monitor channels -- it is the *unexplainability*
-    # that separates a broken electrode from a sick astronaut.
-    if ds.device_share:
-        _dev, share = next(iter(ds.device_share.items()))
-        explained_frac = ds.explained_ss / max(
-            ds.explained_ss + ds.leftover_ss, 1e-9)
-        if share > 0.80 and explained_frac < 0.55:
-            return "instrument"
-
+    # The schedule is checked before the instrument. A crew member being
+    # ground down by a logged flight plan also concentrates its residual in
+    # Bio-Monitor channels, because that is where nine of the twelve channels
+    # live -- so asking "is it the sensor" first answered yes to a finding
+    # whose cause the system had already correctly identified as the roster.
     if ds.plan_share >= _SCHEDULE_SHARE:
         return "schedule"
+
+    # Instrument: the residual is concentrated on one device *beyond what that
+    # device normally contributes*, and no coherent latent state accounts for
+    # it. Both halves are required. A real inflammatory response also
+    # concentrates in Bio-Monitor channels -- it is the unexplainability that
+    # separates a broken electrode from a sick astronaut.
+    if ds.device_share:
+        dev, share = next(iter(ds.device_share.items()))
+        excess = share - ds.device_base.get(dev, 1.0 / max(len(ds.device_share), 1))
+        explained_frac = ds.explained_ss / max(
+            ds.explained_ss + ds.leftover_ss, 1e-9)
+        if excess > _DEVICE_EXCESS and explained_frac < 0.55:
+            return "instrument"
+
     return "individual"
 
 

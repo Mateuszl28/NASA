@@ -39,17 +39,40 @@ from .signals import MONITORED, SIGNALS
 #: asymmetry and restores two-sided observability.
 _SURPLUS_GAIN = 0.35
 
+#: Width of the smooth transition between the deficit and surplus slopes, in
+#: fractional plasma volume. Rounding the corner matters more than it looks:
+#: the hard `max(0, -V)` form put a kink exactly at V = 0, which is exactly
+#: where a healthy astronaut sits. Both the filter's state Jacobian and the
+#: residual projection linearise there, and at a kink the derivative they get
+#: depends on the finite-difference step rather than on the physiology -- the
+#: two disagreed by a factor of 1.75. A tenth of a "worth mentioning" volume
+#: change is narrow enough to leave the asymmetry intact at any clinically
+#: interesting deficit and wide enough that nothing linearises on a corner.
+_VOL_SMOOTH = 0.012
 
-def _vol_effect(V: float) -> float:
-    """Signed plasma-volume effect, positive when depleted."""
-    return max(0.0, -V) - _SURPLUS_GAIN * max(0.0, V)
+
+def vol_effect(V: float) -> float:
+    """Signed plasma-volume effect, positive when depleted.
+
+    Volume loading is genuinely not the mirror image of volume loss -- a litre
+    over does not raise stroke volume the way a litre under lowers it -- so the
+    two sides carry different gains, blended smoothly rather than switched.
+
+    A strictly one-sided response was the first version and it made plasma
+    volume *unobservable* above baseline except through body mass, leaving a
+    latent axis with a single noisy observer that the projection would happily
+    move to explain any persistent body-mass wobble.
+    """
+    w = _SURPLUS_GAIN + (1.0 - _SURPLUS_GAIN) / (
+        1.0 + np.exp(np.clip(V / _VOL_SMOOTH, -60.0, 60.0)))
+    return float(-V * w)
 
 
 def predict(x: np.ndarray, p: Params, u: np.ndarray,
             dose_cum: float = 0.0) -> dict[str, float]:
     """Expected measurement for a latent state, exact (no noise)."""
     A, S, V, F, I, C, M = (float(v) for v in x)
-    dep = _vol_effect(V)
+    dep = vol_effect(V)
 
     out = {
         # --- autonomic and cardiovascular -----------------------------------
