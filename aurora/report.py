@@ -61,10 +61,10 @@ def render(s: Session, *, day: int | None = None) -> str:
                      "3-sigma band when this was raised")
         if f.limit_breach:
             L.append(f"- protocol limit breached: {', '.join(f.limit_breach)}")
-        if f.device_share:
-            dev, sh = next(iter(f.device_share.items()))
-            L.append(f"- residual concentration: {100 * sh:.0f}% on "
-                     f"{DEVICES[dev].name}")
+        if f.device_q:
+            ranked = sorted(f.device_q.items(), key=lambda kv: -kv[1])
+            L.append("- device loudness (1.0 = behaving): " + ", ".join(
+                f"{DEVICES[d].name.split(' (')[0]} {q:.1f}" for d, q in ranked))
         top = sorted(f.latent_z.items(), key=lambda kv: -abs(kv[1]))[:3]
         L.append("- latent shift: " + ", ".join(
             f"{STATE_NAMES[k]} {v:+.1f}" for k, v in top))

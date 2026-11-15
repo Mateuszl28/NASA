@@ -361,10 +361,11 @@ with tabs[2]:
             if f.limit_breach:
                 notes.append("protocol limit breached: "
                              + ", ".join(f.limit_breach))
-            if f.device_share:
-                dv, sh = next(iter(f.device_share.items()))
-                notes.append(f"{100 * sh:.0f}% of the residual on "
-                             f"{DEVICES[dv].name}")
+            if f.device_q:
+                rk = sorted(f.device_q.items(), key=lambda kv: -kv[1])
+                notes.append("device loudness (1.0 = behaving): " + ", ".join(
+                    f"{DEVICES[d].name.split(' (')[0]} {q:.1f}"
+                    for d, q in rk))
             for n in notes:
                 c1.markdown(f"- {n}")
 

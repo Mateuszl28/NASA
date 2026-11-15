@@ -67,7 +67,7 @@ from .model import (
     IDX, NOMINAL_INPUT, N_STATE, STATE, STATE_NAMES, UIDX, Params,
 )
 from .observe import obs_sd
-from .signals import ABSOLUTE_LIMITS, MONITORED, SIGNALS, signals_of
+from .signals import ABSOLUTE_LIMITS, DEVICES, MONITORED, SIGNALS
 from .twin import FilterOut, OpenLoop, Window, open_loop, run_filter
 
 #: Scale of a "unit" change in each latent variable, so that a shift of 1.0
@@ -185,6 +185,13 @@ class Finding:
     in_band_at_start: bool
     limit_breach: tuple[str, ...]
     device_share: dict[str, float]
+    #: The quantity the instrument rule actually decides on: mean squared
+    #: standardised residual per device, near 1.0 when that device is behaving.
+    #: Carried here so the report and the dashboard can show the number the
+    #: decision was made on rather than a different one that happens to be
+    #: available -- the share reads oddly next to an instrument verdict, since
+    #: Bio-Monitor holds most of any residual whatever is wrong.
+    device_q: dict[str, float] = field(default_factory=dict)
     plan_share: float = 0.0
     note: str = ""
 
@@ -823,7 +830,8 @@ def _attribute(ds: DayScore, concurrent: int, env_limit: bool,
         ranked = sorted(ds.device_q.items(), key=lambda kv: -kv[1])
         dev, loud = ranked[0]
         others = [q for _, q in ranked[1:]]
-        if loud > _DEVICE_LOUD and (not others or max(others) < _DEVICE_QUIET):
+        if (DEVICES[dev].hardware and loud > _DEVICE_LOUD
+                and (not others or max(others) < _DEVICE_QUIET)):
             return "instrument"
 
     return "individual"
@@ -926,6 +934,6 @@ def findings(scans: dict[str, list[DayScore]], *, threshold: float = 2.6,
                 pattern_note=note, latent_z=mean_z,
                 in_band_at_start=idx[run[0]].in_band,
                 limit_breach=breaches, device_share=pk.device_share,
-                plan_share=share_ep,
+                device_q=pk.device_q, plan_share=share_ep,
             ))
     return sorted(out, key=lambda f: (f.start, f.crew))

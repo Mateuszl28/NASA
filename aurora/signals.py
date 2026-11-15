@@ -29,6 +29,13 @@ class Device:
     key: str
     name: str
     note: str
+    #: Whether a fault in this "device" is something anybody could repair.
+    #: Only hardware is eligible for an instrument attribution: if mood and
+    #: perceived stress move while nothing physiological does, that is a
+    #: behavioural finding or an under-report, and either way the action is
+    #: about the person. Calling it an instrument fault told a commander to go
+    #: and remount a questionnaire.
+    hardware: bool = True
 
 
 DEVICES: dict[str, Device] = {
@@ -53,6 +60,7 @@ DEVICES: dict[str, Device] = {
         "Crew self-report",
         "Mood and perceived stress. The signals crews under-report, and the "
         "only ones the garment cannot infer.",
+        hardware=False,
     ),
 }
 
