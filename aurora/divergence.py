@@ -151,6 +151,9 @@ class DayScore:
     channel_z: dict[str, float]        # per-channel residual z, latest day
     device_share: dict[str, float]     # share of residual SS per device
     device_base: dict[str, float]      # the same shares when nothing is wrong
+    #: Mean squared standardised residual per device. Near 1.0 means that
+    #: device is behaving; much more means it is not.
+    device_q: dict[str, float]
     pattern: str
     pattern_note: str
     pattern_fit: float
@@ -516,11 +519,19 @@ def plan_share(w: Window, p: Params, fo: FilterOut, day: int, horizon: int, *,
     return float(np.clip(1.0 - r_log / r_nom, 0.0, 1.0))
 
 
-def _device_share(ol: OpenLoop, rcal: ResidCal | None = None) -> dict[str, float]:
-    """How the residual sum of squares splits across physical devices."""
+def _device_stats(ol: OpenLoop, rcal: ResidCal | None = None
+                  ) -> tuple[dict[str, float], dict[str, float]]:
+    """Residual share and mean squared residual, per physical device.
+
+    The share says how the residual splits; the mean square says how loud each
+    device is *in absolute terms*. The second is what distinguishes a broken
+    sensor, and it is only meaningful because the residuals are standardised
+    per channel per forecast step against the quiet window -- so a device with
+    nothing wrong sits near 1.0 whatever its channel count.
+    """
     wt = rcal.weights() if rcal else np.ones(len(MONITORED))
     acc: dict[str, float] = {}
-    tot = 0.0
+    cnt: dict[str, int] = {}
     for i in range(ol.reached):
         m = np.isfinite(ol.resid[i])
         scale = (rcal.step_scales(i) if rcal else np.ones(len(MONITORED)))
@@ -528,10 +539,17 @@ def _device_share(ol: OpenLoop, rcal: ResidCal | None = None) -> dict[str, float
         for ch, v in zip(np.array(MONITORED)[m], z):
             dev = SIGNALS[str(ch)].device
             acc[dev] = acc.get(dev, 0.0) + float(v)
-            tot += float(v)
+            cnt[dev] = cnt.get(dev, 0) + 1
+    tot = sum(acc.values())
     if tot <= 0.0:
-        return {}
-    return {k: v / tot for k, v in sorted(acc.items(), key=lambda kv: -kv[1])}
+        return {}, {}
+    share = {k: v / tot for k, v in sorted(acc.items(), key=lambda kv: -kv[1])}
+    mean_sq = {k: acc[k] / max(cnt[k], 1) for k in acc}
+    return share, mean_sq
+
+
+def _device_share(ol: OpenLoop, rcal: ResidCal | None = None) -> dict[str, float]:
+    return _device_stats(ol, rcal)[0]
 
 
 def _match_pattern(latent_z: dict[str, float]) -> tuple[str, str, float]:
@@ -673,6 +691,7 @@ def scan(w: Window, p: Params, *, crew: str = "?",
         latent_z = {k: latent_push[k] / LATENT_SCALE[k] for k in STATE}
         pattern, note, fit = _match_pattern(latent_z)
 
+        dev_share, dev_q = _device_stats(ol, rcal)
         rs = rcal.step_scales(last)
         ch_z = {ch: float(ol.resid_z[last, j] / rs[j])
                 for j, ch in enumerate(MONITORED)
@@ -695,7 +714,8 @@ def scan(w: Window, p: Params, *, crew: str = "?",
             explained_ss=float(expl), leftover_ss=float(left),
             dof_used=int(round(k_dirs)),
             score=float(score), latent_push=latent_push, latent_z=latent_z,
-            channel_z=ch_z, device_share=_device_share(ol, rcal),
+            channel_z=ch_z,
+            device_share=dev_share, device_q=dev_q,
             device_base=dict(rcal.device_base),
             pattern=pattern, pattern_note=note, pattern_fit=float(fit),
             limit_breach=_limit_breach(w, day), in_band=band_ok,
@@ -712,14 +732,54 @@ def scan(w: Window, p: Params, *, crew: str = "?",
 #: is called the schedule's rather than the body's.
 _SCHEDULE_SHARE = 0.45
 
-#: How far a device's share of the residual must exceed its own quiet-window
-#: share before concentration counts as evidence of a fault.
-_DEVICE_EXCESS = 0.12
+#: What a protocol-limit breach is called, and why it names the finding itself.
+#:
+#: A limit breach is detected on its first day, by design -- a dose rate
+#: thirteen times its alert has to be called immediately. But on that first day
+#: the physiology has not responded yet, so the residual projection has nothing
+#: to work with and names the finding after whichever latent axis the day's
+#: noise happened to favour. The solar particle event came back labelled
+#: "behavioural / psychological strain", which is not a harmless cosmetic slip:
+#: it is the system inventing a physiological story for an environmental fact.
+LIMIT_PATTERNS: dict[str, tuple[str, str]] = {
+    "dose_rate": (
+        "Radiation exposure above protocol limit",
+        "Dose rate past its protocol alert. Environmental, immediate, and not "
+        "a judgement about anybody's body -- a personal baseline is the wrong "
+        "instrument here, because the number is about exposure rather than "
+        "about deviation from habit. Any physiological response follows over "
+        "the next days and is tracked separately."),
+    "spo2": (
+        "Oxygen saturation below protocol limit",
+        "SpO2 past its protocol alert. Check the habitat air before the crew "
+        "member."),
+    "skin_temp": (
+        "Skin temperature in febrile range",
+        "Past the protocol alert. Skin temperature is a proxy for core "
+        "temperature, so this warrants a direct measurement rather than a "
+        "conclusion."),
+}
+
+#: How many of an episode's highest-scoring days decide its name. See the
+#: comment in `findings`: too few and one noisy day renames it, too many and
+#: the aftermath dilutes the signature.
+_NAME_DAYS = 5
+
+#: Mean squared standardised residual above which a device counts as loud, and
+#: below which every other device counts as quiet. Both are required.
+_DEVICE_LOUD = 3.0
+_DEVICE_QUIET = 1.8
 
 
 def _attribute(ds: DayScore, concurrent: int, env_limit: bool,
-               coherent: bool) -> str:
-    """The astronaut, the schedule, the habitat, or the instrument."""
+               coherent: bool, plan_share_episode: float) -> str:
+    """The astronaut, the schedule, the habitat, or the instrument.
+
+    `plan_share_episode` is the episode's value, not this day's. Attribution is
+    a claim about the whole episode, and reading it off the single peak day got
+    the schedule case wrong: the episode's plan share was 0.60, comfortably
+    over the threshold, while the peak day's happened to sit under it.
+    """
     if env_limit:
         return "environment"
 
@@ -736,20 +796,34 @@ def _attribute(ds: DayScore, concurrent: int, env_limit: bool,
     # Bio-Monitor channels, because that is where nine of the twelve channels
     # live -- so asking "is it the sensor" first answered yes to a finding
     # whose cause the system had already correctly identified as the roster.
-    if ds.plan_share >= _SCHEDULE_SHARE:
+    if plan_share_episode >= _SCHEDULE_SHARE:
         return "schedule"
 
-    # Instrument: the residual is concentrated on one device *beyond what that
-    # device normally contributes*, and no coherent latent state accounts for
-    # it. Both halves are required. A real inflammatory response also
-    # concentrates in Bio-Monitor channels -- it is the unexplainability that
-    # separates a broken electrode from a sick astronaut.
-    if ds.device_share:
-        dev, share = next(iter(ds.device_share.items()))
-        excess = share - ds.device_base.get(dev, 1.0 / max(len(ds.device_share), 1))
-        explained_frac = ds.explained_ss / max(
-            ds.explained_ss + ds.leftover_ss, 1e-9)
-        if excess > _DEVICE_EXCESS and explained_frac < 0.55:
+    # Instrument: one device is loud and every other device is quiet.
+    #
+    # The discriminator went through two wrong versions worth recording. The
+    # first asked whether the residual was concentrated on one device, which
+    # fails because Bio-Monitor carries nine of twelve channels and so holds
+    # ~80 % of any residual on a perfectly healthy day. The second added "and
+    # no coherent latent state explains it", which worked only while the
+    # latent prior was tight enough to prevent a good fit -- seven free latent
+    # dimensions against twelve channels can fit almost anything, so once the
+    # prior was loosened to let a real plasma-volume deficit through, a
+    # collapsed electrode became "explainable" too and the rule went silent.
+    #
+    # What actually separates them is physiological rather than statistical. A
+    # body in autonomic collapse moves its mood, its perceived stress and its
+    # mass -- channels that come from a questionnaire and an inertial device,
+    # not from the garment. An electrode that has lost skin contact cannot
+    # touch any of them. So the test is for *other devices staying quiet*,
+    # which is only askable because the residuals are standardised per channel
+    # per step: a device with nothing wrong sits near 1.0 regardless of how
+    # many channels it carries.
+    if ds.device_q:
+        ranked = sorted(ds.device_q.items(), key=lambda kv: -kv[1])
+        dev, loud = ranked[0]
+        others = [q for _, q in ranked[1:]]
+        if loud > _DEVICE_LOUD and (not others or max(others) < _DEVICE_QUIET):
             return "instrument"
 
     return "individual"
@@ -817,7 +891,9 @@ def findings(scans: dict[str, list[DayScore]], *, threshold: float = 2.6,
             doms = dom_by_day.get(peak, [])
             coherent = bool(doms) and max(
                 doms.count(x) for x in set(doms)) >= 3
-            attr = _attribute(pk, by_day.get(peak, 1), breached, coherent)
+            share_ep = max(idx[d].plan_share for d in run)
+            attr = _attribute(pk, by_day.get(peak, 1), breached, coherent,
+                              share_ep)
             breaches = tuple(sorted({b for d in run for b in idx[d].limit_breach}))
 
             # Name the episode from the whole run, score-weighted, not from the
@@ -826,9 +902,10 @@ def findings(scans: dict[str, list[DayScore]], *, threshold: float = 2.6,
             # "behavioural strain" -- the two days either side of the peak had
             # it right. An episode is a claim about a stretch of physiology, so
             # the evidence for its name should be the stretch.
+            core = sorted(run, key=lambda d: -idx[d].score)[:_NAME_DAYS]
             acc = {k: 0.0 for k in STATE}
             wsum = 0.0
-            for d in run:
+            for d in core:
                 wt = max(idx[d].score, 0.0)
                 wsum += wt
                 for k in STATE:
@@ -837,12 +914,18 @@ def findings(scans: dict[str, list[DayScore]], *, threshold: float = 2.6,
                       else pk.latent_z)
             pattern, note, _ = _match_pattern(mean_z)
 
+            # A breach names the finding after itself. See LIMIT_PATTERNS.
+            for b in breaches:
+                if b in LIMIT_PATTERNS:
+                    pattern, note = LIMIT_PATTERNS[b]
+                    break
+
             out.append(Finding(
                 crew=crew, start=run[0], end=run[-1], peak_day=peak,
                 peak_score=pk.score, attribution=attr, pattern=pattern,
                 pattern_note=note, latent_z=mean_z,
                 in_band_at_start=idx[run[0]].in_band,
                 limit_breach=breaches, device_share=pk.device_share,
-                plan_share=max(idx[d].plan_share for d in run),
+                plan_share=share_ep,
             ))
     return sorted(out, key=lambda f: (f.start, f.crew))
