@@ -10,3 +10,7 @@ __pycache__/
 # bundled scenarios are committed on purpose: they make a cold demo start in
 # seconds instead of minutes. Anything fitted to other data is local.
 data/twins/local-*
+
+# Only the default-seed fits are committed (16 kB, makes a cold demo start in
+# seconds). Everything else regenerates on demand, and a fit whose window hash
+# no longer matches is ignored rather than used.
